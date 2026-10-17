@@ -28,6 +28,7 @@ CHART_NAME = {"BTCUSDT": "BTC", "ETHUSDT": "ETH", "SOLUSDT": "SOL", "PAXGUSDT": 
 TF_SEC = {"15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
 RANGE_DAYS = {"7d": 7, "30d": 30, "90d": 90, "180d": 180}
 KLINE_MAX_BARS = 1500
+KLINE_WARMUP = 220  # 额外前取的预热K线数，供EMA/MACD状态机收敛
 
 
 def _load(name, path):
@@ -64,8 +65,9 @@ def fetch_klines_range(symbol, interval, range_key):
     need = min(int(days * 86400 / TF_SEC[interval]) + 5, KLINE_MAX_BARS)
     end_ms = int(time.time() * 1000)
     rows, seen = [], set()
-    while len(rows) < need:
-        lim = min(1000, need - len(rows))
+    total = need + KLINE_WARMUP
+    while len(rows) < total:
+        lim = min(1000, total - len(rows))
         r = _kline_sess.get(BINANCE, params={"symbol": symbol, "interval": interval,
                                              "limit": lim, "endTime": end_ms}, timeout=12)
         batch = r.json()
@@ -81,10 +83,13 @@ def fetch_klines_range(symbol, interval, range_key):
         end_ms = first_open - 1
         time.sleep(0.15)
     rows.sort(key=lambda k: k[0])
-    bars = [{"t": k[0] // 1000, "o": float(k[1]), "h": float(k[2]),
-             "l": float(k[3]), "c": float(k[4]), "v": float(k[5])} for k in rows[-KLINE_MAX_BARS:]]
+    allbars = [{"t": k[0] // 1000, "o": float(k[1]), "h": float(k[2]),
+                "l": float(k[3]), "c": float(k[4]), "v": float(k[5])} for k in rows]
+    # 窗口段（展示/标注只在这一段）与预热段（供指标收敛，不展示）
+    bars = allbars[-need:] if len(allbars) > need else allbars
+    warm = allbars[:-need] if len(allbars) > need else []
     out = {"symbol": symbol, "name": CHART_NAME[symbol], "interval": interval,
-           "range": range_key, "bars": bars,
+           "range": range_key, "bars": bars, "warm": warm,
            "first": dt.datetime.utcfromtimestamp(bars[0]["t"]).strftime("%Y-%m-%d"),
            "last": dt.datetime.utcfromtimestamp(bars[-1]["t"]).strftime("%Y-%m-%d %H:%M")}
     _cache["klines"][ck] = (time.time(), out)
@@ -447,7 +452,7 @@ h1{font-size:19px;margin-right:8px}
 #chart{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:8px}
 #info{color:var(--dim);font-size:12px;margin-top:8px}
 .spin{color:var(--blue)}
-#maLegend span{margin-right:14px}
+#indLegend span{margin-right:14px}
 </style>
 </head>
 <body>
@@ -458,11 +463,17 @@ h1{font-size:19px;margin-right:8px}
   <div class="group" id="symBtns"></div>
   <div class="group" id="tfBtns"></div>
   <div class="group" id="rgBtns"></div>
+  <div class="sep"></div>
+  <div class="group" id="optBtns">
+    <button data-v="macd" class="on">MACD</button>
+    <button data-v="sig" class="on">买卖点</button>
+  </div>
   <span id="load" class="spin" style="font-size:12px"></span>
 </div>
-<div id="legend"><span id="ohlc"></span> <span id="maLegend"></span></div>
+<div id="legend"><span id="ohlc"></span> <span id="indLegend"></span></div>
 <div id="chart"></div>
-<div id="info">数据：币安公共镜像（现货价格模拟合约行情，100x回测/监控同口径）· 30秒自动刷新 · MA7/MA25/MA99 · <span id="rangeInfo"></span></div>
+<div id="info">数据：币安公共镜像（现货价格模拟合约行情，与回测/监控同口径）· 30秒自动刷新 · MA7/MA25/MA99 · MACD(12,26,9)<br>
+买卖点 = MACD 零轴二次交叉形态触发K线（算法与 <span style="color:var(--blue)">.trae/skills/btc-eth-macd-backtest</span> 完全一致：水下金叉→死叉→金叉且DIF抬高=买，水上死叉→金叉→死叉且DIF降低=卖）；SOL 仅形态提示，暂未接入模拟盘 · <span id="rangeInfo"></span></div>
 
 <script>
 const SYMS=[["BTCUSDT","BTC"],["ETHUSDT","ETH"],["SOLUSDT","SOL"],["PAXGUSDT","黄金 PAXG"]];
@@ -488,16 +499,37 @@ const chart=LightweightCharts.createChart(document.getElementById('chart'),{
   timeScale:{borderColor:'#262d36',timeVisible:true,secondsVisible:false},
   rightPriceScale:{borderColor:'#262d36'},
   crosshair:{mode:LightweightCharts.CrosshairMode.Normal},
-  width:document.getElementById('chart').clientWidth,height:560
+  width:document.getElementById('chart').clientWidth,height:600
 });
 window.addEventListener('resize',()=>chart.applyOptions({width:document.getElementById('chart').clientWidth}));
 const candle=chart.addCandlestickSeries({upColor:'#3fb950',downColor:'#f85149',
   wickUpColor:'#3fb950',wickDownColor:'#f85149',borderVisible:false});
 const vol=chart.addHistogramSeries({priceFormat:{type:'volume'},priceScaleId:'vol'});
-chart.priceScale('vol').applyOptions({scaleMargins:{top:0.82,bottom:0}});
+// 三块纵向布局：K线 0~56% / 成交量 56~74% / MACD 78~98%
+chart.priceScale('vol').applyOptions({scaleMargins:{top:0.56,bottom:0.26}});
 const maCfg=[[7,'#f0c04f'],[25,'#58a6ff'],[99,'#d268d2']];
 const maLines=maCfg.map(([n,c])=>chart.addLineSeries({color:c,lineWidth:1,
   priceLineVisible:false,lastValueVisible:false}));
+// MACD 副图（独立 overlay 刻度）
+const macdHist=chart.addHistogramSeries({priceScaleId:'macd',priceLineVisible:false,lastValueVisible:false});
+const macdDif=chart.addLineSeries({color:'#e6edf3',lineWidth:1,priceScaleId:'macd',
+  priceLineVisible:false,lastValueVisible:false});
+const macdDea=chart.addLineSeries({color:'#f0c04f',lineWidth:1,priceScaleId:'macd',
+  priceLineVisible:false,lastValueVisible:false});
+chart.priceScale('macd').applyOptions({scaleMargins:{top:0.78,bottom:0.02}});
+
+let showMacd=true,showSig=true,lastBars=[],lastMacd=null;
+
+document.getElementById('optBtns').querySelectorAll('button').forEach(b=>b.onclick=()=>{
+  b.classList.toggle('on');
+  if(b.dataset.v==='macd'){
+    showMacd=b.classList.contains('on');
+    [macdHist,macdDif,macdDea].forEach(s=>s.applyOptions({visible:showMacd}));
+  }else{
+    showSig=b.classList.contains('on');renderMarkers();
+  }
+  staticLegend();
+});
 
 function sma(bars,n){
   const out=[];let sum=0;
@@ -505,32 +537,102 @@ function sma(bars,n){
     if(i>=n-1)out.push({time:b.t,value:+(sum/n).toFixed(6)});});
   return out;
 }
+// EMA（与 pandas ewm(span=n, adjust=False) 同一递推式）
+function emaArr(vals,n){const k=2/(n+1);const out=[];let e=null;
+  vals.forEach(v=>{e=(e===null)?v:e+k*(v-e);out.push(e);});return out;}
+function calcMacd(bars){
+  const c=bars.map(b=>b.c);
+  const e12=emaArr(c,12),e26=emaArr(c,26);
+  const dif=c.map((_,i)=>e12[i]-e26[i]);
+  const dea=emaArr(dif,9);
+  const hist=dif.map((d,i)=>2*(d-dea[i]));
+  return {dif,dea,hist};
+}
+// MACD 零轴二次交叉双状态机（与 macd_backtest.py generate_signals 逐行对应）
+function findSignals(bars,m){
+  const sig=[];let ls=0,lf=0,ss=0,sf=0;
+  for(let i=1;i<bars.length;i++){
+    const d=m.dif[i],a=m.dea[i],pd=m.dif[i-1],pa=m.dea[i-1];
+    const golden=pd<=pa&&d>a, death=pd>=pa&&d<a;
+    if(d>=0){ls=0;}
+    else if(golden){
+      if(ls===0){ls=1;lf=d;}
+      else if(ls===2){if(d>lf)sig.push({t:bars[i].t,k:1});ls=1;lf=d;}
+    }else if(death&&ls===1){ls=2;}
+    if(d<=0){ss=0;}
+    else if(death){
+      if(ss===0){ss=1;sf=d;}
+      else if(ss===2){if(d<sf)sig.push({t:bars[i].t,k:-1});ss=1;sf=d;}
+    }else if(golden&&ss===1){ss=2;}
+  }
+  return sig;
+}
+let lastSig=[];
+function renderMarkers(){
+  candle.setMarkers(!showSig?[]:lastSig.map(g=>g.k===1
+    ?{time:g.t,position:'belowBar',color:'#3fb950',shape:'arrowUp',text:'买'}
+    :{time:g.t,position:'aboveBar',color:'#f85149',shape:'arrowDown',text:'卖'}));
+}
+function staticLegend(){
+  let h=maCfg.map(([n,c])=>`<span style="color:${c}">MA${n}</span>`).join('');
+  if(showMacd)h+='<span style="color:#e6edf3">DIF</span><span style="color:#f0c04f">DEA</span><span style="color:#8b949e">MACD</span>';
+  document.getElementById('indLegend').innerHTML=h;
+}
 async function load(){
   document.getElementById('load').textContent='加载中…';
   try{
     const r=await fetch(`/api/klines?symbol=${cur.s}&interval=${cur.tf}&range=${cur.rg}`);
     const d=await r.json();
     if(d.error){document.getElementById('load').textContent='错误: '+d.error;return;}
+    // 指标/状态机在 warm(预热)+bars(窗口) 全段上计算，保证EMA收敛、形态跨窗口连续
+    const wl=(d.warm||[]).length, t0=d.bars[0].t;
+    const all=(d.warm||[]).concat(d.bars);
+    const macdAll=calcMacd(all);
+    const dif=macdAll.dif.slice(wl),dea=macdAll.dea.slice(wl),hist=macdAll.hist.slice(wl);
+    lastBars=d.bars;lastMacd={dif,dea,hist};
+    lastSig=findSignals(all,macdAll).filter(g=>g.t>=t0);
     const up0=d.bars[0].c;
     candle.setData(d.bars.map(b=>({time:b.t,open:b.o,high:b.h,low:b.l,close:b.c})));
     vol.setData(d.bars.map(b=>({time:b.t,value:b.v,color:b.c>=b.o?'rgba(63,185,80,.45)':'rgba(248,81,73,.45)'})));
-    maLines.forEach((ln,i)=>ln.setData(sma(d.bars,maCfg[i][0])));
+    maLines.forEach((ln,i)=>ln.setData(sma(all,maCfg[i][0]).slice(wl)));
+    macdHist.setData(d.bars.map((b,i)=>({time:b.t,value:hist[i],
+      color:hist[i]>=0?'rgba(63,185,80,.75)':'rgba(248,81,73,.75)'})));
+    macdDif.setData(d.bars.map((b,i)=>({time:b.t,value:dif[i]})));
+    macdDea.setData(d.bars.map((b,i)=>({time:b.t,value:dea[i]})));
+    renderMarkers();
     const chg=(d.bars[d.bars.length-1].c/up0-1)*100;
+    const buys=lastSig.filter(g=>g.k===1).length,sells=lastSig.filter(g=>g.k===-1).length;
     document.getElementById('rangeInfo').textContent=
-      `${d.name} ${cur.tf} · ${d.first} ~ ${d.last} · 共${d.bars.length}根 · 区间${chg>=0?'+':''}${chg.toFixed(2)}%`;
-    document.getElementById('maLegend').innerHTML=maCfg.map(([n,c],i)=>
-      `<span style="color:${c}">MA${n}</span>`).join('');
+      `${d.name} ${cur.tf} · ${d.first} ~ ${d.last} · 共${d.bars.length}根 · 区间${chg>=0?'+':''}${chg.toFixed(2)}% · 区间内买${buys}/卖${sells}信号`;
+    staticLegend();
     document.getElementById('load').textContent='';
   }catch(e){document.getElementById('load').textContent='请求失败';}
 }
+const fmtN=v=>(v>=0?'':'')+v.toFixed(v>=100?2:4);
 chart.subscribeCrosshairMove(param=>{
-  if(!param.time||!param.seriesData.get(candle)){document.getElementById('ohlc').textContent='';return;}
+  if(!param.time||!param.seriesData.get(candle)){
+    document.getElementById('ohlc').textContent='';staticLegend();return;}
   const b=param.seriesData.get(candle);
   const c=b.close>=b.open?'var(--up)':'var(--dn)';
   document.getElementById('ohlc').innerHTML=
     `<span style="color:${c}">开 ${b.open} 高 ${b.high} 低 ${b.low} 收 ${b.close}</span>`;
+  const i=lastBars.findIndex(x=>x.t===param.time);
+  let h='';
+  if(i>=0){
+    maCfg.forEach(([n,col],j)=>{
+      const sv=param.seriesData.get(maLines[j]);
+      if(sv)h+=`<span style="color:${col}">MA${n} ${fmtN(sv.value)}</span>`;
+    });
+    if(showMacd&&lastMacd){
+      const clr=lastMacd.hist[i]>=0?'var(--up)':'var(--dn)';
+      h+=`<span style="color:#e6edf3">DIF ${fmtN(lastMacd.dif[i])}</span>`
+       +`<span style="color:#f0c04f">DEA ${fmtN(lastMacd.dea[i])}</span>`
+       +`<span style="color:${clr}">MACD ${fmtN(lastMacd.hist[i])}</span>`;
+    }
+  }
+  document.getElementById('indLegend').innerHTML=h;
 });
-sync();load();
+sync();staticLegend();load();
 setInterval(load,30000);
 </script>
 </body></html>
