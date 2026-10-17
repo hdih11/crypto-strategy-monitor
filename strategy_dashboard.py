@@ -10,15 +10,24 @@ Ctrl+C 停止
 import datetime as dt
 import importlib.util
 import json
+import os
 import re
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
 
 import requests
 
 PORT = 8765
-PRICE_TTL, PATTERN_TTL = 10, 60
+PRICE_TTL, PATTERN_TTL, KLINE_TTL = 10, 60, 60
+BINANCE = "https://data-api.binance.vision/api/v3/klines"
+# K线图支持的合约标的（现货价格模拟合约行情）
+CHART_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "PAXGUSDT"]
+CHART_NAME = {"BTCUSDT": "BTC", "ETHUSDT": "ETH", "SOLUSDT": "SOL", "PAXGUSDT": "黄金 PAXG"}
+TF_SEC = {"15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
+RANGE_DAYS = {"7d": 7, "30d": 30, "90d": 90, "180d": 180}
+KLINE_MAX_BARS = 1500
 
 
 def _load(name, path):
@@ -39,7 +48,47 @@ STREAMS = [("ETHUSDT", "1h", 0.01, 0.02),
 SYMBOLS = ["PAXGUSDT", "ETHUSDT", "BTCUSDT"]
 NOTIONAL, FEE_RATE = bt.NOTIONAL, bt.FEE_RATE
 
-_cache = {"prices": (0, None), "patterns": (0, None)}
+_cache = {"prices": (0, None), "patterns": (0, None), "klines": {}}
+
+_kline_sess = requests.Session()
+_kline_sess.trust_env = False  # 绕过失效代理，直连币安镜像
+
+
+def fetch_klines_range(symbol, interval, range_key):
+    """从币安镜像分页拉取指定范围的K线（limit=1000 向前翻页），带60s缓存。"""
+    ck = (symbol, interval, range_key)
+    hit = _cache["klines"].get(ck)
+    if hit and time.time() - hit[0] < KLINE_TTL:
+        return hit[1]
+    days = RANGE_DAYS[range_key]
+    need = min(int(days * 86400 / TF_SEC[interval]) + 5, KLINE_MAX_BARS)
+    end_ms = int(time.time() * 1000)
+    rows, seen = [], set()
+    while len(rows) < need:
+        lim = min(1000, need - len(rows))
+        r = _kline_sess.get(BINANCE, params={"symbol": symbol, "interval": interval,
+                                             "limit": lim, "endTime": end_ms}, timeout=12)
+        batch = r.json()
+        if not isinstance(batch, list) or not batch:
+            break
+        for k in batch:
+            if k[0] not in seen:
+                seen.add(k[0])
+                rows.append(k)
+        first_open = batch[0][0]
+        if len(batch) < lim or first_open >= end_ms:
+            break
+        end_ms = first_open - 1
+        time.sleep(0.15)
+    rows.sort(key=lambda k: k[0])
+    bars = [{"t": k[0] // 1000, "o": float(k[1]), "h": float(k[2]),
+             "l": float(k[3]), "c": float(k[4]), "v": float(k[5])} for k in rows[-KLINE_MAX_BARS:]]
+    out = {"symbol": symbol, "name": CHART_NAME[symbol], "interval": interval,
+           "range": range_key, "bars": bars,
+           "first": dt.datetime.utcfromtimestamp(bars[0]["t"]).strftime("%Y-%m-%d"),
+           "last": dt.datetime.utcfromtimestamp(bars[-1]["t"]).strftime("%Y-%m-%d %H:%M")}
+    _cache["klines"][ck] = (time.time(), out)
+    return out
 
 TS_RE = re.compile(r"^\[([^\]]+)\]\s*(.*)$")
 BAL_RE = re.compile(r"(?:资金池|余额)(-?[\d.]+)U")
@@ -246,7 +295,9 @@ footer{text-align:center;color:var(--dim);font-size:11px;margin-top:18px}
 </style>
 </head>
 <body>
-<h1>策略监控面板 <span id="conn" class="muted" style="font-size:12px"></span></h1>
+<h1>策略监控面板 <span id="conn" class="muted" style="font-size:12px"></span>
+  <a href="/chart" style="font-size:13px;margin-left:14px;text-decoration:none">📈 K线图 (BTC/ETH/SOL/黄金)</a>
+</h1>
 <div class="sub">模拟盘 · 行情来自币安公共镜像 · 20秒自动刷新(<span id="cd">20</span>s) · 更新于 <span id="upd">--</span></div>
 
 <div class="grid">
@@ -372,26 +423,170 @@ refresh();
 """
 
 
+CHART_HTML = """<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>合约行情 K线图</title>
+<script src="/vendor/lightweight-charts.js"></script>
+<style>
+:root{--bg:#0d1117;--card:#161b22;--bd:#262d36;--fg:#e6edf3;--dim:#8b949e;
+--up:#3fb950;--dn:#f85149;--blue:#58a6ff;--gold:#e3b341}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--fg);font:14px/1.5 "Segoe UI","Microsoft YaHei",sans-serif;padding:16px 20px}
+.top{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin-bottom:10px}
+a{color:var(--blue);text-decoration:none;font-size:13px}
+h1{font-size:19px;margin-right:8px}
+.group{display:inline-flex;border:1px solid var(--bd);border-radius:8px;overflow:hidden}
+.group button{background:var(--card);color:var(--dim);border:none;padding:6px 13px;font-size:13px;cursor:pointer}
+.group button.on{background:#1f6feb;color:#fff}
+.group button:not(.on):hover{color:var(--fg)}
+.sep{width:1px;height:20px;background:var(--bd)}
+#legend{font-size:12.5px;color:var(--dim);margin:2px 0 6px;font-family:Consolas,monospace;min-height:18px}
+#chart{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:8px}
+#info{color:var(--dim);font-size:12px;margin-top:8px}
+.spin{color:var(--blue)}
+#maLegend span{margin-right:14px}
+</style>
+</head>
+<body>
+<div class="top">
+  <h1>合约行情 K线图</h1>
+  <a href="/">← 返回监控面板</a>
+  <div class="sep"></div>
+  <div class="group" id="symBtns"></div>
+  <div class="group" id="tfBtns"></div>
+  <div class="group" id="rgBtns"></div>
+  <span id="load" class="spin" style="font-size:12px"></span>
+</div>
+<div id="legend"><span id="ohlc"></span> <span id="maLegend"></span></div>
+<div id="chart"></div>
+<div id="info">数据：币安公共镜像（现货价格模拟合约行情，100x回测/监控同口径）· 30秒自动刷新 · MA7/MA25/MA99 · <span id="rangeInfo"></span></div>
+
+<script>
+const SYMS=[["BTCUSDT","BTC"],["ETHUSDT","ETH"],["SOLUSDT","SOL"],["PAXGUSDT","黄金 PAXG"]];
+const TFS=[["15m","15分"],["1h","1小时"],["4h","4小时"],["1d","日线"]];
+const RGS=[["7d","7天"],["30d","30天"],["90d","90天"],["180d","180天"]];
+let cur={s:"BTCUSDT",tf:"1h",rg:"30d"};
+
+function mkBtns(id,arr,key){
+  const el=document.getElementById(id);
+  el.innerHTML=arr.map(([v,t])=>`<button data-v="${v}">${t}</button>`).join('');
+  el.querySelectorAll('button').forEach(b=>b.onclick=()=>{cur[key]=b.dataset.v;sync();load();});
+}
+mkBtns('symBtns',SYMS,'s');mkBtns('tfBtns',TFS,'tf');mkBtns('rgBtns',RGS,'rg');
+function sync(){
+  [['symBtns','s'],['tfBtns','tf'],['rgBtns','rg']].forEach(([id,k])=>
+    document.getElementById(id).querySelectorAll('button').forEach(b=>
+      b.classList.toggle('on',b.dataset.v===cur[k])));
+}
+
+const chart=LightweightCharts.createChart(document.getElementById('chart'),{
+  layout:{background:{color:'#161b22'},textColor:'#c9d1d9',fontSize:11},
+  grid:{vertLines:{color:'#1b222c'},horzLines:{color:'#1b222c'}},
+  timeScale:{borderColor:'#262d36',timeVisible:true,secondsVisible:false},
+  rightPriceScale:{borderColor:'#262d36'},
+  crosshair:{mode:LightweightCharts.CrosshairMode.Normal},
+  width:document.getElementById('chart').clientWidth,height:560
+});
+window.addEventListener('resize',()=>chart.applyOptions({width:document.getElementById('chart').clientWidth}));
+const candle=chart.addCandlestickSeries({upColor:'#3fb950',downColor:'#f85149',
+  wickUpColor:'#3fb950',wickDownColor:'#f85149',borderVisible:false});
+const vol=chart.addHistogramSeries({priceFormat:{type:'volume'},priceScaleId:'vol'});
+chart.priceScale('vol').applyOptions({scaleMargins:{top:0.82,bottom:0}});
+const maCfg=[[7,'#f0c04f'],[25,'#58a6ff'],[99,'#d268d2']];
+const maLines=maCfg.map(([n,c])=>chart.addLineSeries({color:c,lineWidth:1,
+  priceLineVisible:false,lastValueVisible:false}));
+
+function sma(bars,n){
+  const out=[];let sum=0;
+  bars.forEach((b,i)=>{sum+=b.c;if(i>=n)sum-=bars[i-n].c;
+    if(i>=n-1)out.push({time:b.t,value:+(sum/n).toFixed(6)});});
+  return out;
+}
+async function load(){
+  document.getElementById('load').textContent='加载中…';
+  try{
+    const r=await fetch(`/api/klines?symbol=${cur.s}&interval=${cur.tf}&range=${cur.rg}`);
+    const d=await r.json();
+    if(d.error){document.getElementById('load').textContent='错误: '+d.error;return;}
+    const up0=d.bars[0].c;
+    candle.setData(d.bars.map(b=>({time:b.t,open:b.o,high:b.h,low:b.l,close:b.c})));
+    vol.setData(d.bars.map(b=>({time:b.t,value:b.v,color:b.c>=b.o?'rgba(63,185,80,.45)':'rgba(248,81,73,.45)'})));
+    maLines.forEach((ln,i)=>ln.setData(sma(d.bars,maCfg[i][0])));
+    const chg=(d.bars[d.bars.length-1].c/up0-1)*100;
+    document.getElementById('rangeInfo').textContent=
+      `${d.name} ${cur.tf} · ${d.first} ~ ${d.last} · 共${d.bars.length}根 · 区间${chg>=0?'+':''}${chg.toFixed(2)}%`;
+    document.getElementById('maLegend').innerHTML=maCfg.map(([n,c],i)=>
+      `<span style="color:${c}">MA${n}</span>`).join('');
+    document.getElementById('load').textContent='';
+  }catch(e){document.getElementById('load').textContent='请求失败';}
+}
+chart.subscribeCrosshairMove(param=>{
+  if(!param.time||!param.seriesData.get(candle)){document.getElementById('ohlc').textContent='';return;}
+  const b=param.seriesData.get(candle);
+  const c=b.close>=b.open?'var(--up)':'var(--dn)';
+  document.getElementById('ohlc').innerHTML=
+    `<span style="color:${c}">开 ${b.open} 高 ${b.high} 低 ${b.low} 收 ${b.close}</span>`;
+});
+sync();load();
+setInterval(load,30000);
+</script>
+</body></html>
+"""
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def _send(self, body, ctype, code=200):
-        data = body.encode("utf-8")
+    def _send(self, body, ctype, code=200, extra=None):
+        data = body.encode("utf-8") if isinstance(body, str) else body
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
+        if extra:
+            for k, v in extra.items():
+                self.send_header(k, v)
         self.end_headers()
         self.wfile.write(data)
 
     def do_GET(self):
-        if self.path == "/api/status":
+        parsed = urlparse(self.path)
+        path, q = parsed.path, parse_qs(parsed.query)
+        if path == "/api/status":
             try:
                 self._send(json.dumps(build_status(), ensure_ascii=False),
                            "application/json; charset=utf-8")
             except Exception as e:
                 self._send(json.dumps({"error": str(e)}), "application/json", 500)
-        elif self.path == "/":
+        elif path == "/api/klines":
+            sym = (q.get("symbol", ["BTCUSDT"])[0]).upper()
+            iv = q.get("interval", ["1h"])[0]
+            rg = q.get("range", ["30d"])[0]
+            if sym not in CHART_SYMBOLS or iv not in TF_SEC or rg not in RANGE_DAYS:
+                self._send(json.dumps({"error": "bad params"}),
+                           "application/json; charset=utf-8", 400)
+            else:
+                try:
+                    data = fetch_klines_range(sym, iv, rg)
+                    self._send(json.dumps(data, ensure_ascii=False),
+                               "application/json; charset=utf-8",
+                               extra={"Cache-Control": "no-cache"})
+                except Exception as e:
+                    self._send(json.dumps({"error": str(e)}),
+                               "application/json; charset=utf-8", 502)
+        elif path == "/chart":
+            self._send(CHART_HTML, "text/html; charset=utf-8")
+        elif path == "/vendor/lightweight-charts.js":
+            try:
+                with open("lightweight-charts.js", "rb") as f:
+                    self._send(f.read(), "application/javascript; charset=utf-8",
+                               extra={"Cache-Control": "max-age=86400"})
+            except OSError:
+                self._send("vendor lib missing", "text/plain", 404)
+        elif path == "/":
             self._send(HTML, "text/html; charset=utf-8")
         else:
             self._send("not found", "text/plain", 404)
