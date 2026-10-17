@@ -1,0 +1,36 @@
+# ===== 密钥与个人配置（严禁上传）=====
+coinglass_config.json
+wechat_config.json
+gate_config.json
+*_config_secret.json
+
+# ===== 模拟盘运行状态与日志 =====
+paper_state*.json
+macro_state.json
+report_data.json
+*.log
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# ===== 临时/调试文件 =====
+_check.js
+diag*.py
+diag*.txt
+mptest.png
+
+# ===== IDE / 系统 =====
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# .trae 仅保留技能代码（监控脚本运行时依赖）
+.trae/*
+!.trae/skills/
+.trae/skills/**/__pycache__/
